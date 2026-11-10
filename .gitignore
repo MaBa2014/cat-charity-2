@@ -134,3 +134,8 @@ dmypy.json
 test.db
 .vscode/
 fast_api.db
+
+# QRKot: local SQLite databases and their backups
+fastapi.db
+fastapi.db-*
+fastapi.backup.db
