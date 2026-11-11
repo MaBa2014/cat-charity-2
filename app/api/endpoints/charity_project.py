@@ -1,9 +1,10 @@
 """Публичное чтение проектов и управление проектами суперпользователем."""
 
 from datetime import datetime
+from http import HTTPStatus
 from typing import List
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -16,24 +17,15 @@ from app.schemas.charity_project import (
     CharityProjectUpdate,
 )
 from app.services.investment import invest_donations
+from app.services.validators import (
+    ensure_project_can_be_deleted,
+    ensure_project_is_open,
+    ensure_unique_project_name,
+    get_project_or_404,
+    validate_project_updates,
+)
 
 router = APIRouter(prefix='/charity_project', tags=['charity_projects'])
-
-
-async def _get_project(project_id: int, session: AsyncSession) -> CharityProject:
-    project = await session.get(CharityProject, project_id)
-    if project is None:
-        raise HTTPException(status_code=404, detail='Проект не найден!')
-    return project
-
-
-async def _name_exists(
-    name: str, session: AsyncSession, exclude_id: int = None,
-) -> bool:
-    statement = select(CharityProject.id).where(CharityProject.name == name)
-    if exclude_id is not None:
-        statement = statement.where(CharityProject.id != exclude_id)
-    return (await session.execute(statement)).scalar_one_or_none() is not None
 
 
 @router.get('/', response_model=List[CharityProjectDB],
@@ -43,7 +35,9 @@ async def _name_exists(
 async def get_all_charity_projects(
     session: AsyncSession = Depends(get_async_session),
 ):
-    result = await session.execute(select(CharityProject).order_by(CharityProject.id))
+    result = await session.execute(
+        select(CharityProject).order_by(CharityProject.id)
+    )
     return result.scalars().all()
 
 
@@ -51,17 +45,17 @@ async def get_all_charity_projects(
              response_model_exclude_none=True,
              summary='Создать целевой проект',
              description='Открыть сбор средств на помощь котикам.',
-             responses={400: {'description': 'Неуникальное название проекта'}})
+             responses={
+                 HTTPStatus.BAD_REQUEST: {
+                     'description': 'Неуникальное название проекта',
+                 },
+             })
 async def create_charity_project(
     project_data: CharityProjectCreate,
     session: AsyncSession = Depends(get_async_session),
     user=Depends(current_superuser),
 ):
-    if await _name_exists(project_data.name, session):
-        raise HTTPException(
-            status_code=400,
-            detail='Проект с таким именем уже существует!',
-        )
+    await ensure_unique_project_name(project_data.name, session)
     project = CharityProject(**project_data.model_dump())
     session.add(project)
     try:
@@ -79,35 +73,29 @@ async def create_charity_project(
               summary='Редактировать целевой проект',
               description='Нельзя изменить закрытый проект или уменьшить '
                           'сумму ниже уже полученной.',
-              responses={400: {'description': 'Недопустимое изменение'},
-                         404: {'description': 'Проект не найден'}})
+              responses={
+                  HTTPStatus.BAD_REQUEST: {
+                      'description': 'Недопустимое изменение',
+                  },
+                  HTTPStatus.NOT_FOUND: {
+                      'description': 'Проект не найден',
+                  },
+              })
 async def update_charity_project(
     project_id: int,
     project_data: CharityProjectUpdate,
     session: AsyncSession = Depends(get_async_session),
     user=Depends(current_superuser),
 ):
-    project = await _get_project(project_id, session)
-    if project.fully_invested:
-        raise HTTPException(status_code=400,
-                            detail='Закрытый проект нельзя редактировать!')
+    project = await get_project_or_404(project_id, session)
+    ensure_project_is_open(project)
     updates = project_data.model_dump(exclude_unset=True)
-    if 'full_amount' in updates and updates['full_amount'] is not None:
-        if updates['full_amount'] < project.invested_amount:
-            raise HTTPException(
-                status_code=400,
-                detail='Нельзя установить сумму меньше уже вложенной!',
-            )
-    if updates.get('name') is not None and await _name_exists(
-        updates['name'], session, exclude_id=project_id,
-    ):
-        raise HTTPException(status_code=400,
-                            detail='Проект с таким именем уже существует!')
+    validate_project_updates(project, updates)
+    if updates.get('name') is not None:
+        await ensure_unique_project_name(
+            updates['name'], session, exclude_id=project_id,
+        )
     for field, value in updates.items():
-        # Pydantic допускает Optional; обязательные поля БД не обнуляем.
-        if value is None:
-            raise HTTPException(status_code=422,
-                                detail=f'Поле {field} не может быть null')
         setattr(project, field, value)
     if project.full_amount == project.invested_amount:
         project.fully_invested = True
@@ -119,20 +107,22 @@ async def update_charity_project(
 @router.delete('/{project_id}', response_model=CharityProjectDB,
                response_model_exclude_none=True,
                summary='Удалить неинвестированный проект',
-               description='Удалить можно только открытый проект без вложений.',
-               responses={400: {'description': 'Проект уже получил средства'},
-                          404: {'description': 'Проект не найден'}})
+               description='Удалить открытый проект без вложений.',
+               responses={
+                   HTTPStatus.BAD_REQUEST: {
+                       'description': 'Проект уже получил средства',
+                   },
+                   HTTPStatus.NOT_FOUND: {
+                       'description': 'Проект не найден',
+                   },
+               })
 async def delete_charity_project(
     project_id: int,
     session: AsyncSession = Depends(get_async_session),
     user=Depends(current_superuser),
 ):
-    project = await _get_project(project_id, session)
-    if project.fully_invested or project.invested_amount:
-        raise HTTPException(
-            status_code=400,
-            detail='В проект были внесены средства, не подлежит удалению!',
-        )
+    project = await get_project_or_404(project_id, session)
+    ensure_project_can_be_deleted(project)
     await session.delete(project)
     await session.commit()
     return project
